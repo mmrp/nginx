@@ -30,6 +30,8 @@ typedef struct {
     ngx_array_t               *grpc_lengths;
     ngx_array_t               *grpc_values;
 
+    ngx_flag_t                 grpc_web_proto;
+
 #if (NGX_HTTP_SSL)
     ngx_uint_t                 ssl;
     ngx_uint_t                 ssl_protocols;
@@ -123,6 +125,9 @@ typedef struct {
     unsigned                   rst:1;
     unsigned                   goaway:1;
 
+    unsigned                   is_grpc_web_proto:1;
+    ngx_str_t                  resp_grpc_status;
+
     ngx_http_request_t        *request;
 
     ngx_str_t                  host;
@@ -215,6 +220,8 @@ static ngx_int_t ngx_http_grpc_set_ssl(ngx_conf_t *cf,
     ngx_http_grpc_loc_conf_t *glcf);
 #endif
 
+// store the next filter, this will called when our custom filter processing is done
+static ngx_http_output_body_filter_pt    ngx_http_next_body_filter;
 
 static ngx_conf_bitmask_t  ngx_http_grpc_next_upstream_masks[] = {
     { ngx_string("error"), NGX_HTTP_UPSTREAM_FT_ERROR },
@@ -357,6 +364,13 @@ static ngx_command_t  ngx_http_grpc_commands[] = {
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_grpc_loc_conf_t, upstream.ignore_headers),
       &ngx_http_upstream_ignore_headers_masks },
+
+    { ngx_string("grpc_web_proto"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_grpc_loc_conf_t, grpc_web_proto),
+      NULL },
 
 #if (NGX_HTTP_SSL)
 
@@ -1041,7 +1055,7 @@ ngx_http_grpc_create_request(ngx_http_request_t *r)
             ngx_strlow(key_tmp, key_tmp, key_len);
 
             ngx_log_debug4(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                           "grpc header: \"%*s: %*s\"",
+                           "first grpc header: \"%*s: %*s\"",
                            key_len, key_tmp, val_len, val_tmp);
         }
 #endif
@@ -1050,6 +1064,16 @@ ngx_http_grpc_create_request(ngx_http_request_t *r)
     if (glcf->upstream.pass_request_headers) {
         part = &r->headers_in.headers.part;
         header = part->elts;
+
+        // update content-type to application/grpc+proto
+        if(glcf->grpc_web_proto) {
+            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "curr grpc content-type: \"%*s: %*s\"",
+                           r->headers_in.content_type->key, r->headers_in.content_type->value);
+            ngx_str_t app_grpc = ngx_string("application/grpc+proto");
+            r->headers_in.content_type->value = app_grpc;
+            ctx->is_grpc_web_proto = 1;
+        }
 
         for (i = 0; /* void */; i++) {
 
@@ -1071,18 +1095,38 @@ ngx_http_grpc_create_request(ngx_http_request_t *r)
 
             *b->last++ = 0;
 
+            // handle grpc-web+proto
+            /*if ((ngx_strncasecmp(header[i].key.data, (u_char *)"Content-Type", sizeof("Content-Type") - 1) == 0) &&
+                (ngx_strncasecmp(header[i].value.data, (u_char *) "application/grpc-web+proto",
+                  sizeof("application/grpc-web+proto") - 1) == 0)) {
+
+                b->last = ngx_http_v2_write_name(b->last, header[i].key.data,
+                                                 header[i].key.len, tmp);
+
+                ngx_str_t app_grpc = ngx_string("application/grpc+proto");
+                b->last = ngx_http_v2_write_value(b->last, app_grpc.data,
+                                                  app_grpc.len, tmp);
+                ctx->is_grpc_web_proto = 1;
+            } else {
+
+                b->last = ngx_http_v2_write_name(b->last, header[i].key.data,
+                                                 header[i].key.len, tmp);
+
+                b->last = ngx_http_v2_write_value(b->last, header[i].value.data,
+                                                  header[i].value.len, tmp);
+            }*/
+
             b->last = ngx_http_v2_write_name(b->last, header[i].key.data,
                                              header[i].key.len, tmp);
 
             b->last = ngx_http_v2_write_value(b->last, header[i].value.data,
                                               header[i].value.len, tmp);
-
 #if (NGX_DEBUG)
             if (r->connection->log->log_level & NGX_LOG_DEBUG_HTTP) {
                 ngx_strlow(tmp, header[i].key.data, header[i].key.len);
 
                 ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                               "grpc header: \"%*s: %V\"",
+                               "second grpc header: \"%*s: %V\"",
                                header[i].key.len, tmp, &header[i].value);
             }
 #endif
@@ -1816,6 +1860,13 @@ ngx_http_grpc_process_header(ngx_http_request_t *r)
 
                 /* a header line has been parsed successfully */
 
+               if (ctx->is_grpc_web_proto && (ngx_strncasecmp(ctx->name.data, (u_char *)"Content-Type",
+                        sizeof("Content-Type") - 1) == 0)) {
+
+                    ngx_str_t app_grpc_web = ngx_string("application/grpc-web+proto");
+                    ctx->value = app_grpc_web;
+                }
+
                 ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "grpc header: \"%V: %V\"",
                                &ctx->name, &ctx->value);
@@ -1947,6 +1998,112 @@ ngx_http_grpc_process_header(ngx_http_request_t *r)
     }
 }
 
+static ngx_int_t
+ngx_http_grpc_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
+{
+    if (in == NULL) {
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+            "http grpc body filter: empty chain");
+        return ngx_http_next_body_filter(r, in);
+    }
+
+    ngx_http_grpc_ctx_t  *ctx;
+    ctx = ngx_http_get_module_ctx(r, ngx_http_grpc_module);
+    if (!ctx) {
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+            "http grpc body filter: ctx not valid");
+            return ngx_http_next_body_filter(r, in);
+    }
+
+    if(!ctx->is_grpc_web_proto) {
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+            "http grpc body filter: not grpc web proto req");
+            return ngx_http_next_body_filter(r, in);
+    }
+
+    if(!ctx->resp_grpc_status.len) {
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+            "http grpc body filter: grpc-status trailer not found");
+            return ngx_http_next_body_filter(r, in);
+    }
+
+    ngx_chain_t *chain_link;
+    int chain_contains_last_buffer = 0;
+
+    // grpc+web-proto expects grpc-status to be present in the response
+    // 1. check for grpc+web-proto response
+    // 2. find the last buffer and append the new buffer containing grpc-status
+    chain_link = in;
+    for ( ; ; ) {
+        if (chain_link->buf->last_buf)
+            chain_contains_last_buffer = 1;
+        if (chain_link->next == NULL)
+            break;
+        chain_link = chain_link->next;
+    }
+
+    if (!chain_contains_last_buffer) {
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+            "http grpc body filter: not contain last buffer");
+        return ngx_http_next_body_filter(r, in);
+    }
+
+    ngx_buf_t    *b;
+    b = ngx_calloc_buf(r->pool);
+    if (b == NULL) {
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+            "http grpc body filter: failed to allocate buffer");
+        return NGX_ERROR;
+    }
+
+    ngx_chain_t   *added_link;
+    added_link = ngx_alloc_chain_link(r->pool);
+    if (added_link == NULL)
+        return NGX_ERROR;
+
+    b->memory = 1;
+
+    u_char data[25] = {'\0'};
+
+    const int len = 15 + ctx->resp_grpc_status.len;
+    const int TRLR_HDR_SIZE = 5;
+
+    // according to spec, the trailer should be of this format
+    // [header-of-trailer + trailer-data]
+    // create [header-of-trailer]
+    // format:
+    // byte-0 : id
+    // byte-{1-4}: trailer-size
+    // byte: 0 1 2 3 4
+    // (1<<7) [size-of-trailer]
+
+    data[0] = 1 << 7;
+    data[4] = (len >> 0)  & 0xff;
+    data[3] = (len >> 8)  & 0xff;
+    data[2] = (len >> 16) & 0xff;
+    data[1] = (len >> 24) & 0xff;
+
+    // [grpc-status:char-11]':'[space:char-1][status:string-of-max-2-bytes-2][\r:char-1][\n:char-1]
+    ngx_sprintf((data+5), "grpc-status: %V\r\n", &ctx->resp_grpc_status);
+
+    b->pos = data;
+    b->last = b->pos + TRLR_HDR_SIZE + len;
+
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+        "http grpc body filter: updating response body to add grpc-status:%V, %d", &ctx->resp_grpc_status, ctx->resp_grpc_status.len);
+
+    // add new buffer
+    added_link->buf = b;
+    added_link->next = NULL;
+    chain_link->next = added_link;
+
+    // update the new buffer as last-buffer
+    chain_link->buf->last_buf = 0;
+    added_link->buf->last_buf = 1;
+
+    return ngx_http_next_body_filter(r, in);
+}
+
 
 static ngx_int_t
 ngx_http_grpc_filter_init(void *data)
@@ -1982,6 +2139,11 @@ ngx_http_grpc_filter_init(void *data)
 
     } else {
         u->length = 1;
+    }
+
+    if(ctx->is_grpc_web_proto && (ngx_http_top_body_filter != ngx_http_grpc_body_filter)) {
+        ngx_http_next_body_filter = ngx_http_top_body_filter;
+        ngx_http_top_body_filter = ngx_http_grpc_body_filter;
     }
 
     return NGX_OK;
@@ -2298,6 +2460,12 @@ ngx_http_grpc_filter(void *data, ssize_t bytes)
                 if (rc == NGX_OK) {
 
                     /* a header line has been parsed successfully */
+
+                    // save grpc-status to header
+                    if (ctx->is_grpc_web_proto && ngx_strncasecmp(ctx->name.data,
+                          (u_char*)"grpc-status", sizeof("grpc-status") - 1) == 0) {
+                        ctx->resp_grpc_status = ctx->value;
+                    }
 
                     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                    "grpc trailer: \"%V: %V\"",
@@ -4375,6 +4543,8 @@ ngx_http_grpc_create_loc_conf(ngx_conf_t *cf)
 
     conf->upstream.intercept_errors = NGX_CONF_UNSET;
 
+    conf->grpc_web_proto = NGX_CONF_UNSET;
+
 #if (NGX_HTTP_SSL)
     conf->upstream.ssl_session_reuse = NGX_CONF_UNSET;
     conf->upstream.ssl_name = NGX_CONF_UNSET_PTR;
@@ -4462,6 +4632,9 @@ ngx_http_grpc_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
     ngx_conf_merge_value(conf->upstream.intercept_errors,
                               prev->upstream.intercept_errors, 0);
+
+    ngx_conf_merge_value(conf->grpc_web_proto,
+                              prev->grpc_web_proto, 0);
 
 #if (NGX_HTTP_SSL)
 
